@@ -3,16 +3,23 @@ package com.rohan.weatherwidget;
 import android.app.PendingIntent;
 import android.appwidget.AppWidgetManager;
 import android.appwidget.AppWidgetProvider;
+import android.Manifest;
 import android.app.AlarmManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.location.Address;
+import android.location.Geocoder;
+import android.location.Location;
+import android.location.LocationManager;
 import android.text.SpannableStringBuilder;
 import android.text.format.DateFormat;
 import android.text.Spanned;
@@ -35,14 +42,26 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class WeatherWidget extends AppWidgetProvider {
-    // ponytail: fixed to Dublin; switch to device location if you travel with it
-    static final String WEATHER_URL = "https://api.open-meteo.com/v1/forecast?latitude=53.35&longitude=-6.26"
+    static final String WEATHER_URL = "https://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f"
             + "&current=temperature_2m,apparent_temperature,weather_code"
             + "&daily=temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,uv_index_max,precipitation_sum"
             + "&hourly=precipitation_probability,precipitation&timezone=auto&forecast_days=2";
-    static final String WARNINGS_URL = "https://www.met.ie/Open_Data/json/warning_EI07.json"; // EI07 = Dublin
+    // all of Ireland; each warning lists affected counties by code
+    static final String WARNINGS_URL = "https://www.met.ie/Open_Data/json/warning_IRELAND.json";
+    // Met Éireann county codes (FIPS 10-4); Republic of Ireland only
+    static final Map<String, String> COUNTIES = Map.ofEntries(
+            Map.entry("carlow", "EI01"), Map.entry("cavan", "EI02"), Map.entry("clare", "EI03"), Map.entry("cork", "EI04"),
+            Map.entry("donegal", "EI06"), Map.entry("dublin", "EI07"), Map.entry("galway", "EI10"), Map.entry("kerry", "EI11"),
+            Map.entry("kildare", "EI12"), Map.entry("kilkenny", "EI13"), Map.entry("leitrim", "EI14"), Map.entry("laois", "EI15"),
+            Map.entry("limerick", "EI16"), Map.entry("longford", "EI18"), Map.entry("louth", "EI19"), Map.entry("mayo", "EI20"),
+            Map.entry("meath", "EI21"), Map.entry("monaghan", "EI22"), Map.entry("offaly", "EI23"), Map.entry("roscommon", "EI24"),
+            Map.entry("sligo", "EI25"), Map.entry("tipperary", "EI26"), Map.entry("waterford", "EI27"), Map.entry("westmeath", "EI29"),
+            Map.entry("wexford", "EI30"), Map.entry("wicklow", "EI31"));
     static final int HOURS = 12;
     static final String TICK = "com.rohan.weatherwidget.TICK";
     static final ZoneId MUMBAI = ZoneId.of("Asia/Kolkata");
@@ -174,8 +193,10 @@ public class WeatherWidget extends AppWidgetProvider {
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         v.setOnClickPendingIntent(R.id.root, refresh);
         fillClock(c, v);
+        Place place = locate(c);
+        v.setTextViewText(R.id.place, place.name.toUpperCase(Locale.ROOT));
         try {
-            fillWeather(v);
+            fillWeather(v, place);
         } catch (Exception e) {
             // keep the last good forecast on screen, just flag the failure
             v = new RemoteViews(c.getPackageName(), R.layout.widget);
@@ -185,7 +206,11 @@ public class WeatherWidget extends AppWidgetProvider {
             return;
         }
         try {
-            fillWarnings(v);
+            if (place.county != null) fillWarnings(v, place.county);
+            else {
+                v.setTextViewText(R.id.warning, "○ NO WARNING FEED HERE · IRELAND ONLY");
+                v.setTextColor(R.id.warning, GREY);
+            }
         } catch (Exception e) {
             v.setTextViewText(R.id.warning, "COULDN'T CHECK MET ÉIREANN WARNINGS");
             v.setTextColor(R.id.warning, GREY);
@@ -194,8 +219,66 @@ public class WeatherWidget extends AppWidgetProvider {
         m.updateAppWidget(ids, v);
     }
 
-    static void fillWeather(RemoteViews v) throws Exception {
-        JSONObject j = new JSONObject(get(WEATHER_URL));
+    static class Place {
+        final double lat, lon;
+        final String name, county; // county = Met Éireann code, null outside Ireland
+
+        Place(double lat, double lon, String name, String county) {
+            this.lat = lat; this.lon = lon; this.name = name; this.county = county;
+        }
+    }
+
+    // city-level fix; falls back to the last place we resolved, then Dublin
+    static Place locate(Context c) {
+        SharedPreferences sp = c.getSharedPreferences("place", Context.MODE_PRIVATE);
+        Place last = new Place(sp.getFloat("lat", 53.35f), sp.getFloat("lon", -6.26f),
+                sp.getString("name", "Dublin"), sp.getString("county", "EI07"));
+        if (c.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return last;
+
+        LocationManager lm = c.getSystemService(LocationManager.class);
+        String provider = lm.hasProvider(LocationManager.FUSED_PROVIDER) ? LocationManager.FUSED_PROVIDER : LocationManager.NETWORK_PROVIDER;
+        Location loc = null;
+        try {
+            CountDownLatch done = new CountDownLatch(1);
+            AtomicReference<Location> got = new AtomicReference<>();
+            lm.getCurrentLocation(provider, null, c.getMainExecutor(), l -> { got.set(l); done.countDown(); });
+            done.await(8, TimeUnit.SECONDS);
+            loc = got.get() != null ? got.get() : lm.getLastKnownLocation(provider);
+        } catch (Exception ignored) {
+        }
+        if (loc == null) return last;
+
+        String name = null, county = null;
+        try {
+            @SuppressWarnings("deprecation") // sync variant is fine: we're already off the main thread
+            List<Address> found = new Geocoder(c, Locale.ENGLISH).getFromLocation(loc.getLatitude(), loc.getLongitude(), 1);
+            if (found != null && !found.isEmpty()) {
+                Address a = found.get(0);
+                name = a.getLocality() != null ? a.getLocality() : a.getSubAdminArea() != null ? a.getSubAdminArea() : a.getAdminArea();
+                if ("IE".equals(a.getCountryCode())) county = countyCode(a.getAdminArea(), a.getSubAdminArea(), a.getLocality());
+            }
+        } catch (Exception ignored) {
+        }
+        if (name == null) name = String.format(Locale.ROOT, "%.1f, %.1f", loc.getLatitude(), loc.getLongitude());
+        name = name.replaceFirst("^(County|Co\\.) ", ""); // "County Dublin" -> "Dublin"
+        Place p = new Place(loc.getLatitude(), loc.getLongitude(), name, county);
+        sp.edit().putFloat("lat", (float) p.lat).putFloat("lon", (float) p.lon)
+                .putString("name", p.name).putString("county", p.county).apply();
+        return p;
+    }
+
+    // geocoder says "County Dublin", "Co. Cork", "Dublin" etc.
+    static String countyCode(String... names) {
+        for (String n : names) {
+            if (n == null) continue;
+            String k = n.toLowerCase(Locale.ROOT).replace("county", "").replace("co.", "").trim();
+            if (COUNTIES.containsKey(k)) return COUNTIES.get(k);
+        }
+        return null;
+    }
+
+    static void fillWeather(RemoteViews v, Place place) throws Exception {
+        JSONObject j = new JSONObject(get(String.format(Locale.ROOT, WEATHER_URL, place.lat, place.lon)));
         JSONObject cur = j.getJSONObject("current"), d = j.getJSONObject("daily"), h = j.getJSONObject("hourly");
         int code = cur.getInt("weather_code");
 
@@ -235,7 +318,7 @@ public class WeatherWidget extends AppWidgetProvider {
         v.setImageViewBitmap(R.id.rain, chart(labels, p, amount));
     }
 
-    static void fillWarnings(RemoteViews v) throws Exception {
+    static void fillWarnings(RemoteViews v, String county) throws Exception {
         JSONArray a = new JSONArray(get(WARNINGS_URL));
         DateTimeFormatter f = DateTimeFormatter.ofPattern("EEE h:mma", Locale.ENGLISH);
         OffsetDateTime now = OffsetDateTime.now();
@@ -244,7 +327,8 @@ public class WeatherWidget extends AppWidgetProvider {
         for (int i = 0; i < a.length(); i++) {
             JSONObject w = a.getJSONObject(i);
             OffsetDateTime onset = OffsetDateTime.parse(w.getString("onset")), expiry = OffsetDateTime.parse(w.getString("expiry"));
-            if (expiry.isBefore(now)) continue;
+            JSONArray regions = w.optJSONArray("regions"); // missing = nationwide
+            if (expiry.isBefore(now) || (regions != null && !regions.toString().contains("\"" + county + "\""))) continue;
             String level = w.getString("level");
             if (rank(level) > rank(worst)) worst = level;
             if (sb.length() > 0) sb.append('\n');
